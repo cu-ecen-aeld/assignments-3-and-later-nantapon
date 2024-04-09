@@ -1,3 +1,4 @@
+// Hi
 #include <syslog.h>
 #include <stdio.h>
 #include <sys/types.h>
