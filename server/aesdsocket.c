@@ -13,12 +13,32 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <pthread.h>
+#include "queue.h"
+#include <stdatomic.h>
+#include <stdlib.h>
 
+struct thread_data {
+  int sock;
+  struct sockaddr sa;
+  socklen_t salen;
+  pthread_t thread;
+  volatile bool thread_exited;
+  SLIST_ENTRY(thread_data) next;
+};
+
+static int fd = -1;
 static bool sig_recvd = false;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint32_t thread_exit_counter = 0;
+static SLIST_HEAD(thread_data_head, thread_data) list = SLIST_HEAD_INITIALIZER(thread_data_head);
+static pthread_t main_thread;
+static sigset_t signal_mask;
+
 
 static void sighandler(int x)
 {
-  sig_recvd = true;
+
 }
 
 static bool read_packet(int sock, int fd)
@@ -86,6 +106,113 @@ static void send_response(int sock, int fd)
   }
 }
 
+static void *thread_start(void *arg)
+{
+  struct thread_data *td = arg;
+  char ipaddr[40];
+
+  pthread_mutex_lock(&mutex);
+
+  if (inet_ntop(AF_INET, &((struct sockaddr_in *)&td->sa)->sin_addr, ipaddr, sizeof(ipaddr)) == NULL) {
+    strncpy(ipaddr, "???", sizeof(ipaddr));
+  }
+  syslog(LOG_DEBUG, "Accepted connection from %s", ipaddr);
+
+  if (!read_packet(td->sock, fd)) {
+    syslog(LOG_ERR, "Error in read_packet!");
+  } else {
+    send_response(td->sock, fd);
+  }
+
+  close(td->sock);
+  td->sock = -1;
+  syslog(LOG_DEBUG, "Closed connection from %s", ipaddr);
+  __atomic_store_n(&td->thread_exited, true, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&thread_exit_counter, 1, __ATOMIC_RELEASE);
+
+  pthread_mutex_unlock(&mutex);
+  return NULL;
+}
+
+static void *timer_thread_start(void *arg)
+{
+  char buffer[100];
+  time_t t;
+  struct tm tm;
+  size_t n;
+
+  while (!sig_recvd) {
+    if (usleep(10 * 1000000) == -1) {
+      continue;
+    }
+
+    pthread_mutex_lock(&mutex);
+    do {
+      t = time(NULL);
+      if (localtime_r(&t, &tm) == NULL) {
+        syslog(LOG_ERR, "localtime_r returns error: %s", strerror(errno));
+        break;
+      }
+
+      if ((n = strftime(buffer, sizeof(buffer), "timestamp:%a, %d %b %Y %T %z\n", &tm)) == 0) {
+        syslog(LOG_ERR, "strftime returns error");
+        break;
+      }
+
+      if (write(fd, buffer, n) == -1) {
+        syslog(LOG_ERR, "Error in write!: %s", strerror(errno));
+        break;
+      }
+    } while(0);
+
+    pthread_mutex_unlock(&mutex);
+  }
+  return NULL;
+}
+
+static void *signal_thread_start(void *arg)
+{
+  int rc;
+  int sig_caught;
+
+  while (true) { 
+    if ((rc = sigwait(&signal_mask, &sig_caught)) != 0) {
+      syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc)); 
+    }
+    switch (sig_caught)
+    {
+    case SIGINT:   
+    case SIGTERM:
+        sig_recvd = true;
+        pthread_kill(main_thread, SIGUSR1);
+        return NULL;
+
+    default:      
+      syslog(LOG_ERR, "Unexpected signal: %d", sig_caught); 
+    }
+  }
+}
+
+static bool start_server_thread(int sock, const struct sockaddr *sa, socklen_t salen)
+{
+  struct thread_data *td = calloc(1, sizeof(struct thread_data));
+  int rc = 0;
+  if (!td) {
+      return false;
+  }
+  td->sock = sock;
+  td->sa = *sa;
+  td->salen = salen;
+
+  if ((rc = pthread_create(&td->thread, NULL, thread_start, td)) != 0) {
+      free(td);
+      syslog(LOG_ERR, "pthread_create returns error: %s", strerror(rc));
+      return false;
+  }
+
+  return true;
+}
+
 int main(int argc, char **argv)
 {
   int i = 0;
@@ -98,11 +225,15 @@ int main(int argc, char **argv)
   int retval = -1;
   struct sockaddr sa;
   socklen_t salen;
-  int fd = -1;
-  char ipaddr[40];
-  struct sigaction sigact;
   int val=1;
+  uint32_t exit_counter = 0;
+  struct thread_data *td = NULL;
+  struct thread_data *td_next = NULL;
+  pthread_t timer_thread;
+  pthread_t signal_thread;
+  struct sigaction sigact;
 
+  main_thread = pthread_self();
   memset(&hints, 0, sizeof(hints));
   openlog(NULL, 0, LOG_USER);
 
@@ -169,40 +300,71 @@ int main(int argc, char **argv)
 
   memset(&sigact, 0, sizeof(sigact));
   sigact.sa_handler = sighandler;
-  sigaction(SIGINT, &sigact, NULL);
-  sigaction(SIGTERM, &sigact, NULL);
+  sigaction(SIGUSR1, &sigact, NULL);
+
+  sigemptyset (&signal_mask);
+  sigaddset (&signal_mask, SIGINT);
+  sigaddset (&signal_mask, SIGTERM);
+  if ((rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL)) == -1) {
+    syslog(LOG_ERR, "pthread_sigmask returns error: %s", strerror(rc));
+    goto exit;
+  }
+
+  if ((rc = pthread_create(&signal_thread, NULL, signal_thread_start, NULL)) != 0) {
+    syslog(LOG_ERR, "pthread_create returns error: %s", strerror(rc));
+    goto exit;
+  }
+
+  if ((rc = pthread_create(&timer_thread, NULL, timer_thread_start, NULL)) != 0) {
+    syslog(LOG_ERR, "pthread_create returns error: %s", strerror(rc));
+    goto exit;
+  }
 
   while(!sig_recvd) {
+    uint32_t e = 0;
+    int child = -1;
+
     salen = sizeof(sa);
     if ((child = accept(sock, &sa, &salen)) == -1) {
       syslog(LOG_ERR, "Error in accept!: %s", strerror(errno));
       continue;
     }
 
-    if (inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, ipaddr, sizeof(ipaddr)) == NULL) {
-      strncpy(ipaddr, "???", sizeof(ipaddr));
-    }
-    syslog(LOG_DEBUG, "Accepted connection from %s", ipaddr);
+    start_server_thread(child, &sa, salen);
 
-    if (!read_packet(child, fd)) {
-      syslog(LOG_ERR, "Error in read_packet!");
-    } else {
-      send_response(child, fd);
+    if (exit_counter < (e = __atomic_load_n(&thread_exit_counter, __ATOMIC_ACQUIRE))) {
+      exit_counter = e;
+      SLIST_FOREACH_SAFE(td, &list, next, td_next) {
+        if (__atomic_load_n(&td->thread_exited, __ATOMIC_ACQUIRE)) {
+          SLIST_REMOVE(&list, td, thread_data, next);
+          if ((rc = pthread_join(td->thread, NULL)) != 0) {
+            syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
+          }
+          free(td);
+        }
+      }
     }
-
-    close(child);
-    child = -1;
-    syslog(LOG_DEBUG, "Closed connection from %s", ipaddr);
   }
 
   if (sig_recvd) {
     syslog(LOG_ERR, "Caught signal, exiting");
   }
 
-  if (child != -1) {
-    close(child);
-    child = -1;
-    syslog(LOG_DEBUG, "Closed connection from %s", ipaddr);
+  pthread_kill(timer_thread, SIGUSR1);
+
+  SLIST_FOREACH_SAFE(td, &list, next, td_next) {
+    if ((rc = pthread_join(td->thread, NULL)) != 0) {
+      syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
+    }
+    free(td);
+  }
+
+  if ((rc = pthread_join(timer_thread, NULL)) != 0) {
+      syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
+  }
+
+  if ((rc = pthread_join(signal_thread, NULL)) != 0) {
+      syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
   }
 
   retval = 0;
@@ -220,6 +382,7 @@ exit:
   if (fd != -1) {
     close(fd);
   }
+  unlink("/var/tmp/aesdsocketdata");
   closelog();
   return retval;
 }
