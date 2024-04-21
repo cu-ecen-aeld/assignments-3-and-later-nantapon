@@ -210,11 +210,11 @@ void aesd_cleanup_module(void)
      */
     {
         uint8_t index;
-        struct aesd_circular_buffer buffer;
         struct aesd_buffer_entry *entry;
-        AESD_CIRCULAR_BUFFER_FOREACH(entry,&buffer,index) {
+        AESD_CIRCULAR_BUFFER_FOREACH(entry,&aesd_device.cbuf,index) {
             kfree(entry->buffptr);
         }
+        kfree(aesd_device.working_entry.buffptr);
     }
 
     unregister_chrdev_region(devno, 1);
