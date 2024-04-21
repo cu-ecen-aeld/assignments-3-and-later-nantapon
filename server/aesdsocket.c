@@ -47,20 +47,32 @@ static void sighandler(int x)
 
 static bool read_packet(int sock, int fd)
 {
+  bool retval = false;
   char buffer[4096];
   ssize_t numbytes = 0;
+#if !USE_AESD_CHAR_DEVICE
   off_t start_offset = lseek(fd, 0, SEEK_END);
+#endif
   char *p = NULL;
   bool done = false;
+
+#if USE_AESD_CHAR_DEVICE
+  // reopen the device so that we can start from the begining.
+  fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
+  if (fd == -1) {
+    syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
+    return false;
+  }
+#endif
 
   while (!sig_recvd && !done) {
     numbytes = recv(sock, buffer, sizeof(buffer), 0);
     if (numbytes == -1) {
       syslog(LOG_ERR, "Error in recv!: %s", strerror(errno));
-      return false;
+      goto exit;
     } else if (numbytes == 0) {
       // EOF
-      return false;
+      goto exit;
     }
 
     p = memchr(buffer, '\n', numbytes);
@@ -72,16 +84,25 @@ static bool read_packet(int sock, int fd)
 
     if (write(fd, buffer, numbytes) == -1) {
       syslog(LOG_ERR, "Error in write!: %s", strerror(errno));
+#if !USE_AESD_CHAR_DEVICE
       ftruncate(fd, start_offset);
-      return false;
+#endif
+      goto exit;
     }
   }
 
   if (sig_recvd) {
-    return false;
+    goto exit;
   }
 
-  return true;
+  retval = true;
+
+exit:
+#if USE_AESD_CHAR_DEVICE
+  close(fd);
+#endif
+  return retval;
+
 }
 
 static void send_response(int sock, int fd)
@@ -308,15 +329,13 @@ int main(int argc, char **argv)
     }
   }
 
-#if USE_AESD_CHAR_DEVICE
-  fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
-#else
+#if !USE_AESD_CHAR_DEVICE
   fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_TRUNC | O_RDWR, 0644);
-#endif
   if (fd == -1) {
     syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
     goto exit;
   }
+#endif
 
   if (listen(sock, 10) == -1) {
     syslog(LOG_ERR, "Error in listen!: %s", strerror(errno));
