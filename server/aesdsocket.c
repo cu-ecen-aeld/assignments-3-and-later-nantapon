@@ -94,22 +94,32 @@ static void send_response(int sock, int fd)
     syslog(LOG_ERR, "Error in lseek!: %s", strerror(errno));
     return;
   }
+#else
+  // reopen the device so that we can start from the begining.
+  fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
+  if (fd == -1) {
+    syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
+    return;
+  }
 #endif
 
   while (!sig_recvd) {
     numbytes = read(fd, buffer, sizeof(buffer));
     if (numbytes == 0) {
-      return;
+      break;
     } else if (numbytes == -1) {
       syslog(LOG_ERR, "Error in read!: %s", strerror(errno));
-      return;
+      break;
     }
     
     if (send(sock, buffer, numbytes, 0) == -1) {
       syslog(LOG_ERR, "Error in send!: %s", strerror(errno));
-      return;
+      break;
     }
   }
+#if USE_AESD_CHAR_DEVICE
+  close(fd);
+#endif
 }
 
 static void *thread_start(void *arg)
