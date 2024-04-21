@@ -18,6 +18,10 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 struct thread_data {
   int sock;
   struct sockaddr sa;
@@ -85,10 +89,12 @@ static void send_response(int sock, int fd)
   ssize_t numbytes = 0;
   char buffer[4096];
 
+#if !USE_AESD_CHAR_DEVICE
   if ((lseek(fd, 0, SEEK_SET)) == -1) {
-    syslog(LOG_ERR, "Error in lssek!: %s", strerror(errno));
+    syslog(LOG_ERR, "Error in lseek!: %s", strerror(errno));
     return;
   }
+#endif
 
   while (!sig_recvd) {
     numbytes = read(fd, buffer, sizeof(buffer));
@@ -232,6 +238,11 @@ int main(int argc, char **argv)
   pthread_t timer_thread;
   pthread_t signal_thread;
   struct sigaction sigact;
+#if USE_AESD_CHAR_DEVICE
+  bool enable_timer = false;
+#else
+  bool enable_timer = true;
+#endif
 
   main_thread = pthread_self();
   memset(&hints, 0, sizeof(hints));
@@ -287,7 +298,11 @@ int main(int argc, char **argv)
     }
   }
 
+#if USE_AESD_CHAR_DEVICE
+  fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
+#else
   fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_TRUNC | O_RDWR, 0644);
+#endif
   if (fd == -1) {
     syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
     goto exit;
@@ -315,9 +330,11 @@ int main(int argc, char **argv)
     goto exit;
   }
 
-  if ((rc = pthread_create(&timer_thread, NULL, timer_thread_start, NULL)) != 0) {
-    syslog(LOG_ERR, "pthread_create returns error: %s", strerror(rc));
-    goto exit;
+  if (enable_timer) {
+    if ((rc = pthread_create(&timer_thread, NULL, timer_thread_start, NULL)) != 0) {
+      syslog(LOG_ERR, "pthread_create returns error: %s", strerror(rc));
+      goto exit;
+    }
   }
 
   while(!sig_recvd) {
@@ -350,7 +367,9 @@ int main(int argc, char **argv)
     syslog(LOG_ERR, "Caught signal, exiting");
   }
 
-  pthread_kill(timer_thread, SIGUSR1);
+  if (enable_timer) {
+    pthread_kill(timer_thread, SIGUSR1);
+  }
 
   SLIST_FOREACH_SAFE(td, &list, next, td_next) {
     if ((rc = pthread_join(td->thread, NULL)) != 0) {
@@ -359,8 +378,10 @@ int main(int argc, char **argv)
     free(td);
   }
 
-  if ((rc = pthread_join(timer_thread, NULL)) != 0) {
-      syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
+  if (enable_timer) {
+    if ((rc = pthread_join(timer_thread, NULL)) != 0) {
+        syslog(LOG_ERR, "pthread_join returns error: %s", strerror(rc));
+    }
   }
 
   if ((rc = pthread_join(signal_thread, NULL)) != 0) {
@@ -382,7 +403,9 @@ exit:
   if (fd != -1) {
     close(fd);
   }
+#if !USE_AESD_CHAR_DEVICE
   unlink("/var/tmp/aesdsocketdata");
+#endif
   closelog();
   return retval;
 }
