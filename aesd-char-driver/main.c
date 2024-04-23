@@ -19,6 +19,8 @@
 #include <linux/fs.h> // file_operations
 #include <linux/slab.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -147,12 +149,72 @@ exit:
     mutex_unlock(&ad->mutex);
     return retval;
 }
+
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    loff_t retval;
+    struct aesd_dev *ad = filp->private_data;
+    loff_t total_size = 0;
+
+    PDEBUG("seek %llu bytes using whence=%d", offset, whence);
+    /**
+     * TODO: handle write
+     */    
+    if (mutex_lock_interruptible(&ad->mutex)) {
+        return -ERESTARTSYS;
+    }
+
+    total_size = (loff_t) aesd_circular_buffer_get_total_size(&ad->cbuf);
+    
+    retval = fixed_size_llseek(filp, offset, whence, total_size);
+
+    mutex_unlock(&ad->mutex);
+    return retval;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev *ad = filp->private_data;
+    struct aesd_seekto seekto;
+    loff_t offset = 0;
+
+    PDEBUG("ioctl cmd=%u", cmd);
+
+    if (cmd != AESDCHAR_IOCSEEKTO) {
+        return -ENOTTY;
+    }
+
+    if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto))!=0) {
+        return -EFAULT;
+    }
+
+    PDEBUG("ioctl: seekto=%d, %d", seekto.write_cmd, seekto.write_cmd_offset);
+
+    if (mutex_lock_interruptible(&ad->mutex)) {
+        return -ERESTARTSYS;
+    }
+
+    offset = (off_t) aesd_circular_buffer_get_offset(&ad->cbuf, seekto.write_cmd, seekto.write_cmd_offset);
+    if (offset < 0) {
+        offset = -EINVAL;
+        goto exit;
+    }
+
+    filp->f_pos = offset;
+
+exit:
+    mutex_unlock(&ad->mutex);
+    return offset;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
+    .unlocked_ioctl =   aesd_ioctl
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)

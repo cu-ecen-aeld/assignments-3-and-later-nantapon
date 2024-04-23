@@ -17,10 +17,14 @@
 #include "queue.h"
 #include <stdatomic.h>
 #include <stdlib.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
 #endif
+
+#define CONTROL_MSG "AESDCHAR_IOCSEEKTO:"
+#define CONTROL_MSG_SIZE (sizeof(CONTROL_MSG)-1)
 
 struct thread_data {
   int sock;
@@ -45,7 +49,7 @@ static void sighandler(int x)
 
 }
 
-static bool read_packet(int sock, int fd)
+static bool read_packet(int sock, int fd, int *outfd, bool *control)
 {
   bool retval = false;
   char buffer[4096];
@@ -55,6 +59,8 @@ static bool read_packet(int sock, int fd)
 #endif
   char *p = NULL;
   bool done = false;
+
+  *control = false;
 
 #if USE_AESD_CHAR_DEVICE
   // reopen the device so that we can start from the begining.
@@ -82,12 +88,45 @@ static bool read_packet(int sock, int fd)
       done = true;
     }
 
-    if (write(fd, buffer, numbytes) == -1) {
-      syslog(LOG_ERR, "Error in write!: %s", strerror(errno));
+    if ((done && (numbytes >= CONTROL_MSG_SIZE) && !memcmp(CONTROL_MSG, buffer, CONTROL_MSG_SIZE))) {
+      struct aesd_seekto seekto;
+      char *endptr = NULL;
+
+      buffer[numbytes-1] = 0;
+      if ((p = strchr(buffer, ',')) == NULL) {
+        syslog(LOG_ERR, "Malformed control msg!");
+        goto exit;
+      }
+      *p = 0;
+
+      seekto.write_cmd = (uint32_t) strtoul(buffer + CONTROL_MSG_SIZE, &endptr, 10);
+      if (!buffer[CONTROL_MSG_SIZE] || (*endptr != 0)) {
+        syslog(LOG_ERR, "Malformed control msg!");
+        goto exit;
+      }
+
+      seekto.write_cmd_offset = (uint32_t) strtoul(p+1, &endptr, 10);
+      if (!p[1] || (*endptr != 0)) {
+        syslog(LOG_ERR, "Malformed control msg!");
+        goto exit;
+      }
+
+      syslog(LOG_DEBUG, "ioctl:seekto %d, %d", seekto.write_cmd, seekto.write_cmd_offset);
+      if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+        syslog(LOG_ERR, "Error in ioctl!: %s", strerror(errno));
+        goto exit;
+      }
+
+      *outfd = fd;
+      *control = true;
+    } else {
+      if (write(fd, buffer, numbytes) == -1) {
+        syslog(LOG_ERR, "Error in write!: %s", strerror(errno));
 #if !USE_AESD_CHAR_DEVICE
-      ftruncate(fd, start_offset);
+        ftruncate(fd, start_offset);
 #endif
-      goto exit;
+        goto exit;
+      }
     }
   }
 
@@ -99,13 +138,14 @@ static bool read_packet(int sock, int fd)
 
 exit:
 #if USE_AESD_CHAR_DEVICE
-  close(fd);
+  if (!*control || !retval) {
+    close(fd);
+  }
 #endif
   return retval;
-
 }
 
-static void send_response(int sock, int fd)
+static void send_response(int sock, int fd, bool control)
 {
   ssize_t numbytes = 0;
   char buffer[4096];
@@ -117,10 +157,12 @@ static void send_response(int sock, int fd)
   }
 #else
   // reopen the device so that we can start from the begining.
-  fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
-  if (fd == -1) {
-    syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
-    return;
+  if (!control) {
+    fd = open("/dev/aesdchar", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    if (fd == -1) {
+      syslog(LOG_ERR, "Error opening file!: %s", strerror(errno));
+      return;
+    }
   }
 #endif
 
@@ -147,6 +189,8 @@ static void *thread_start(void *arg)
 {
   struct thread_data *td = arg;
   char ipaddr[40];
+  bool control = false;
+  int fd1 = fd;
 
   pthread_mutex_lock(&mutex);
 
@@ -155,10 +199,10 @@ static void *thread_start(void *arg)
   }
   syslog(LOG_DEBUG, "Accepted connection from %s", ipaddr);
 
-  if (!read_packet(td->sock, fd)) {
+  if (!read_packet(td->sock, fd1, &fd1, &control)) {
     syslog(LOG_ERR, "Error in read_packet!");
   } else {
-    send_response(td->sock, fd);
+    send_response(td->sock, fd1, control);
   }
 
   close(td->sock);

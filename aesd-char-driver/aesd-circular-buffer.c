@@ -85,6 +85,72 @@ const char *aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, 
     return removed; 
 }
 
+
+size_t aesd_circular_buffer_get_total_size(struct aesd_circular_buffer *buffer)
+{
+    uint8_t n = 0;
+    uint8_t curr;
+    uint8_t i;
+    size_t total = 0;
+
+    if (buffer->full) {
+        n = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else {
+        n = buffer->in_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buffer->out_offs;
+        if (n >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+            n -= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        }
+    }
+
+    curr = buffer->out_offs;
+    for (i=0; i < n; ++i) {
+        total += buffer->entry[curr].size;
+        curr++;
+        if (curr >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+            curr = 0;
+        }
+    }
+    return total;
+}
+
+long aesd_circular_buffer_get_offset(struct aesd_circular_buffer *buffer, uint32_t write_cmd, uint32_t write_cmd_offset)
+{
+    uint8_t n = 0;
+    uint8_t curr;
+    uint8_t i;
+    long total = 0;
+
+    if (buffer->full) {
+        n = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else {
+        n = buffer->in_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buffer->out_offs;
+        if (n >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+            n -= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        }
+    }
+
+    if (write_cmd >= n) {
+        return -1;
+    }
+
+    curr = buffer->out_offs;
+    for (i=0; i < write_cmd; ++i) {
+        total += buffer->entry[curr].size;
+        curr++;
+        if (curr >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+            curr = 0;
+        }
+    }
+
+    if (write_cmd_offset >= buffer->entry[curr].size) {
+        return -1;
+    }
+    total += write_cmd_offset;
+
+    return total;
+}
+
+
 /**
 * Initializes the circular buffer described by @param buffer to an empty struct
 */
